@@ -1,84 +1,29 @@
-*.tar.gz
+# Patterns that are specific to a text editor, IDE, operating system, or user
+# environment are not added here. They should be added to your local gitignore
+# file instead:
+# https://docs.github.com/en/get-started/git-basics/ignoring-files#configuring-ignored-files-for-all-repositories-on-your-computer
 
-*.exe
-src/bitcoin
-src/bitcoind
-src/bitcoin-cli
-src/test/test_bitcoin
-src/qt/test/test_bitcoin-qt
+# Build subdirectories.
+/*build*
+!/build-aux
+!/build_msvc
 
-Makefile.in
-aclocal.m4
-autom4te.cache/
-config.log
-config.status
-configure
-src/bitcoin-config.h
-src/bitcoin-config.h.in
-src/build-aux/
-src/stamp-h1
-share/setup.nsi
-share/qt/Info.plist
+*.pyc
 
-src/qt/*.moc
-src/qt/moc_*.cpp
-src/qt/forms/ui_*.h
-
-src/qt/test/moc*.cpp
-
-.deps
-.dirstamp
-.*.swp
-*.*~*
-*.bak
-*.rej
-*.orig
-*.o
+# Only ignore unexpected patches
 *.patch
-.bitcoin
-*.a
-*.pb.cc
-*.pb.h
+!ci/test/*.patch
+!contrib/guix/patches/*.patch
+!depends/patches/**/*.patch
 
-*.log
-*.trs
-*.dmg
+/CMakeUserPresets.json
 
-*.json.h
-*.raw.h
+# Previous releases
+/releases
 
-# Compilation and Qt preprocessor part
-*.qm
-Makefile
-bitcoin-qt
-Bitcoin-Qt.app
+# cargo default target dir
+target/
 
-# Unit-tests
-Makefile.test
-bitcoin-qt_test
+/guix-build-*
 
-# Resources cpp
-qrc_*.cpp
-
-# Qt creator
-*.pro.user
-
-# Mac specific
-.DS_Store
-build
-
-#lcov
-*.gcno
-/*.info
-test_bitcoin.coverage/
-total.coverage/
-coverage_percent.txt
-
-#build tests
-linux-coverage-build
-linux-build
-win32-build
-qa/pull-tester/run-bitcoind-for-test.sh
-qa/pull-tester/build-tests.sh
-
-!src/leveldb*/Makefile
+/ci/scratch/

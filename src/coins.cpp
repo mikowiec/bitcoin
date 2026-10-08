@@ -1,196 +1,460 @@
-// Copyright (c) 2012-2013 The Bitcoin developers
-// Distributed under the MIT/X11 software license, see the accompanying
+// Copyright (c) 2012-present The Bitcoin Core developers
+// Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#include "coins.h"
+#include <coins.h>
 
-#include <assert.h>
+#include <consensus/consensus.h>
+#include <primitives/block.h>
+#include <random.h>
+#include <uint256.h>
+#include <util/log.h>
+#include <util/threadpool.h>
+#include <util/trace.h>
 
-// calculate number of bytes for the bitmask, and its number of non-zero bytes
-// each bit in the bitmask represents the availability of one output, but the
-// availabilities of the first two outputs are encoded separately
-void CCoins::CalcMaskSize(unsigned int &nBytes, unsigned int &nNonzeroBytes) const {
-    unsigned int nLastUsedByte = 0;
-    for (unsigned int b = 0; 2+b*8 < vout.size(); b++) {
-        bool fZero = true;
-        for (unsigned int i = 0; i < 8 && 2+b*8+i < vout.size(); i++) {
-            if (!vout[2+b*8+i].IsNull()) {
-                fZero = false;
-                continue;
-            }
+#include <ranges>
+#include <unordered_set>
+
+TRACEPOINT_SEMAPHORE(utxocache, add);
+TRACEPOINT_SEMAPHORE(utxocache, spent);
+TRACEPOINT_SEMAPHORE(utxocache, uncache);
+
+SaltedCoinsCacheHasher::SaltedCoinsCacheHasher(bool deterministic)
+    : m_hasher{
+          deterministic ? 0x8e819f2607a18de6 : FastRandomContext().rand64(),
+          deterministic ? 0xf4020d2e3983b0eb : FastRandomContext().rand64()}
+{
+}
+
+CoinsViewEmpty& CoinsViewEmpty::Get()
+{
+    static CoinsViewEmpty instance;
+    return instance;
+}
+
+std::optional<Coin> CCoinsViewCache::PeekCoin(const COutPoint& outpoint) const
+{
+    if (auto it{cacheCoins.find(outpoint)}; it != cacheCoins.end()) {
+        return it->second.coin.IsSpent() ? std::nullopt : std::optional{it->second.coin};
+    }
+    return base->PeekCoin(outpoint);
+}
+
+CCoinsViewCache::CCoinsViewCache(CCoinsView* in_base, bool deterministic) :
+    CCoinsViewBacked(in_base), m_deterministic(deterministic),
+    cacheCoins(0, SaltedCoinsCacheHasher{/*deterministic=*/deterministic}, CCoinsMap::key_equal{}, &m_cache_coins_memory_resource)
+{
+    m_sentinel.second.SelfRef(m_sentinel);
+}
+
+size_t CCoinsViewCache::DynamicMemoryUsage() const {
+    return memusage::DynamicUsage(cacheCoins) + cachedCoinsUsage;
+}
+
+std::optional<Coin> CCoinsViewCache::FetchCoinFromBase(const COutPoint& outpoint) const
+{
+    return base->GetCoin(outpoint);
+}
+
+CCoinsMap::iterator CCoinsViewCache::FetchCoin(const COutPoint &outpoint) const {
+    const auto [ret, inserted] = cacheCoins.try_emplace(outpoint);
+    if (inserted) {
+        if (auto coin{FetchCoinFromBase(outpoint)}) {
+            ret->second.coin = std::move(*coin);
+            cachedCoinsUsage += ret->second.coin.DynamicMemoryUsage();
+            Assert(!ret->second.coin.IsSpent());
+        } else {
+            cacheCoins.erase(ret);
+            return cacheCoins.end();
         }
-        if (!fZero) {
-            nLastUsedByte = b + 1;
-            nNonzeroBytes++;
-        }
     }
-    nBytes += nLastUsedByte;
-}
-
-bool CCoins::Spend(const COutPoint &out, CTxInUndo &undo) {
-    if (out.n >= vout.size())
-        return false;
-    if (vout[out.n].IsNull())
-        return false;
-    undo = CTxInUndo(vout[out.n]);
-    vout[out.n].SetNull();
-    Cleanup();
-    if (vout.size() == 0) {
-        undo.nHeight = nHeight;
-        undo.fCoinBase = fCoinBase;
-        undo.nVersion = this->nVersion;
-    }
-    return true;
-}
-
-bool CCoins::Spend(int nPos) {
-    CTxInUndo undo;
-    COutPoint out(0, nPos);
-    return Spend(out, undo);
-}
-
-
-bool CCoinsView::GetCoins(const uint256 &txid, CCoins &coins) { return false; }
-bool CCoinsView::SetCoins(const uint256 &txid, const CCoins &coins) { return false; }
-bool CCoinsView::HaveCoins(const uint256 &txid) { return false; }
-uint256 CCoinsView::GetBestBlock() { return uint256(0); }
-bool CCoinsView::SetBestBlock(const uint256 &hashBlock) { return false; }
-bool CCoinsView::BatchWrite(const std::map<uint256, CCoins> &mapCoins, const uint256 &hashBlock) { return false; }
-bool CCoinsView::GetStats(CCoinsStats &stats) { return false; }
-
-
-CCoinsViewBacked::CCoinsViewBacked(CCoinsView &viewIn) : base(&viewIn) { }
-bool CCoinsViewBacked::GetCoins(const uint256 &txid, CCoins &coins) { return base->GetCoins(txid, coins); }
-bool CCoinsViewBacked::SetCoins(const uint256 &txid, const CCoins &coins) { return base->SetCoins(txid, coins); }
-bool CCoinsViewBacked::HaveCoins(const uint256 &txid) { return base->HaveCoins(txid); }
-uint256 CCoinsViewBacked::GetBestBlock() { return base->GetBestBlock(); }
-bool CCoinsViewBacked::SetBestBlock(const uint256 &hashBlock) { return base->SetBestBlock(hashBlock); }
-void CCoinsViewBacked::SetBackend(CCoinsView &viewIn) { base = &viewIn; }
-bool CCoinsViewBacked::BatchWrite(const std::map<uint256, CCoins> &mapCoins, const uint256 &hashBlock) { return base->BatchWrite(mapCoins, hashBlock); }
-bool CCoinsViewBacked::GetStats(CCoinsStats &stats) { return base->GetStats(stats); }
-
-CCoinsViewCache::CCoinsViewCache(CCoinsView &baseIn, bool fDummy) : CCoinsViewBacked(baseIn), hashBlock(0) { }
-
-bool CCoinsViewCache::GetCoins(const uint256 &txid, CCoins &coins) {
-    if (cacheCoins.count(txid)) {
-        coins = cacheCoins[txid];
-        return true;
-    }
-    if (base->GetCoins(txid, coins)) {
-        cacheCoins[txid] = coins;
-        return true;
-    }
-    return false;
-}
-
-std::map<uint256,CCoins>::iterator CCoinsViewCache::FetchCoins(const uint256 &txid) {
-    std::map<uint256,CCoins>::iterator it = cacheCoins.lower_bound(txid);
-    if (it != cacheCoins.end() && it->first == txid)
-        return it;
-    CCoins tmp;
-    if (!base->GetCoins(txid,tmp))
-        return cacheCoins.end();
-    std::map<uint256,CCoins>::iterator ret = cacheCoins.insert(it, std::make_pair(txid, CCoins()));
-    tmp.swap(ret->second);
     return ret;
 }
 
-CCoins &CCoinsViewCache::GetCoins(const uint256 &txid) {
-    std::map<uint256,CCoins>::iterator it = FetchCoins(txid);
-    assert(it != cacheCoins.end());
-    return it->second;
+std::optional<Coin> CCoinsViewCache::GetCoin(const COutPoint& outpoint) const
+{
+    if (auto it{FetchCoin(outpoint)}; it != cacheCoins.end() && !it->second.coin.IsSpent()) return it->second.coin;
+    return std::nullopt;
 }
 
-bool CCoinsViewCache::SetCoins(const uint256 &txid, const CCoins &coins) {
-    cacheCoins[txid] = coins;
+void CCoinsViewCache::AddCoin(const COutPoint &outpoint, Coin&& coin, bool possible_overwrite) {
+    assert(!coin.IsSpent());
+    if (coin.out.scriptPubKey.IsUnspendable()) return;
+    CCoinsMap::iterator it;
+    bool inserted;
+    std::tie(it, inserted) = cacheCoins.emplace(std::piecewise_construct, std::forward_as_tuple(outpoint), std::tuple<>());
+    bool fresh = false;
+    if (!possible_overwrite) {
+        if (!it->second.coin.IsSpent()) {
+            throw std::logic_error("Attempted to overwrite an unspent coin (when possible_overwrite is false)");
+        }
+        // If the coin exists in this cache as a spent coin and is DIRTY, then
+        // its spentness hasn't been flushed to the parent cache. We're
+        // re-adding the coin to this cache now but we can't mark it as FRESH.
+        // If we mark it FRESH and then spend it before the cache is flushed
+        // we would remove it from this cache and would never flush spentness
+        // to the parent cache.
+        //
+        // Re-adding a spent coin can happen in the case of a re-org (the coin
+        // is 'spent' when the block adding it is disconnected and then
+        // re-added when it is also added in a newly connected block).
+        //
+        // If the coin doesn't exist in the current cache, or is spent but not
+        // DIRTY, then it can be marked FRESH.
+        fresh = !it->second.IsDirty();
+    }
+    if (!inserted) {
+        Assume(TrySub(m_dirty_count, it->second.IsDirty()));
+        Assume(TrySub(cachedCoinsUsage, it->second.coin.DynamicMemoryUsage()));
+    }
+    it->second.coin = std::move(coin);
+    CCoinsCacheEntry::SetDirty(*it, m_sentinel);
+    ++m_dirty_count;
+    if (fresh) CCoinsCacheEntry::SetFresh(*it, m_sentinel);
+    cachedCoinsUsage += it->second.coin.DynamicMemoryUsage();
+    TRACEPOINT(utxocache, add,
+           outpoint.hash.data(),
+           (uint32_t)outpoint.n,
+           (uint32_t)it->second.coin.nHeight,
+           (int64_t)it->second.coin.out.nValue,
+           (bool)it->second.coin.IsCoinBase());
+}
+
+void CCoinsViewCache::EmplaceCoinInternalDANGER(const COutPoint& outpoint, Coin&& coin) {
+    const auto mem_usage{coin.DynamicMemoryUsage()};
+    auto [it, inserted] = cacheCoins.try_emplace(outpoint, std::move(coin));
+    if (inserted) {
+        CCoinsCacheEntry::SetDirty(*it, m_sentinel);
+        ++m_dirty_count;
+        cachedCoinsUsage += mem_usage;
+    }
+}
+
+void AddCoins(CCoinsViewCache& cache, const CTransaction &tx, int nHeight, bool check_for_overwrite) {
+    bool fCoinbase = tx.IsCoinBase();
+    const Txid& txid = tx.GetHash();
+    for (size_t i = 0; i < tx.vout.size(); ++i) {
+        bool overwrite = check_for_overwrite ? cache.HaveCoin(COutPoint(txid, i)) : fCoinbase;
+        // Coinbase transactions can always be overwritten, in order to correctly
+        // deal with the pre-BIP30 occurrences of duplicate coinbase transactions.
+        cache.AddCoin(COutPoint(txid, i), Coin(tx.vout[i], nHeight, fCoinbase), overwrite);
+    }
+}
+
+bool CCoinsViewCache::SpendCoin(const COutPoint &outpoint, Coin* moveout) {
+    CCoinsMap::iterator it = FetchCoin(outpoint);
+    if (it == cacheCoins.end()) return false;
+    Assume(TrySub(m_dirty_count, it->second.IsDirty()));
+    Assume(TrySub(cachedCoinsUsage, it->second.coin.DynamicMemoryUsage()));
+    TRACEPOINT(utxocache, spent,
+           outpoint.hash.data(),
+           (uint32_t)outpoint.n,
+           (uint32_t)it->second.coin.nHeight,
+           (int64_t)it->second.coin.out.nValue,
+           (bool)it->second.coin.IsCoinBase());
+    if (moveout) {
+        *moveout = std::move(it->second.coin);
+    }
+    if (it->second.IsFresh()) {
+        cacheCoins.erase(it);
+    } else {
+        CCoinsCacheEntry::SetDirty(*it, m_sentinel);
+        ++m_dirty_count;
+        it->second.coin.Clear();
+    }
     return true;
 }
 
-bool CCoinsViewCache::HaveCoins(const uint256 &txid) {
-    return FetchCoins(txid) != cacheCoins.end();
+static const Coin coinEmpty;
+
+const Coin& CCoinsViewCache::AccessCoin(const COutPoint &outpoint) const {
+    CCoinsMap::const_iterator it = FetchCoin(outpoint);
+    if (it == cacheCoins.end()) {
+        return coinEmpty;
+    } else {
+        return it->second.coin;
+    }
 }
 
-uint256 CCoinsViewCache::GetBestBlock() {
-    if (hashBlock == uint256(0))
-        hashBlock = base->GetBestBlock();
-    return hashBlock;
+bool CCoinsViewCache::HaveCoin(const COutPoint& outpoint) const
+{
+    CCoinsMap::const_iterator it = FetchCoin(outpoint);
+    return (it != cacheCoins.end() && !it->second.coin.IsSpent());
 }
 
-bool CCoinsViewCache::SetBestBlock(const uint256 &hashBlockIn) {
-    hashBlock = hashBlockIn;
-    return true;
+bool CCoinsViewCache::HaveCoinInCache(const COutPoint &outpoint) const {
+    CCoinsMap::const_iterator it = cacheCoins.find(outpoint);
+    return (it != cacheCoins.end() && !it->second.coin.IsSpent());
 }
 
-bool CCoinsViewCache::BatchWrite(const std::map<uint256, CCoins> &mapCoins, const uint256 &hashBlockIn) {
-    for (std::map<uint256, CCoins>::const_iterator it = mapCoins.begin(); it != mapCoins.end(); it++)
-        cacheCoins[it->first] = it->second;
-    hashBlock = hashBlockIn;
-    return true;
+uint256 CCoinsViewCache::GetBestBlock() const {
+    if (m_block_hash.IsNull())
+        m_block_hash = base->GetBestBlock();
+    return m_block_hash;
 }
 
-bool CCoinsViewCache::Flush() {
-    bool fOk = base->BatchWrite(cacheCoins, hashBlock);
-    if (fOk)
-        cacheCoins.clear();
-    return fOk;
+void CCoinsViewCache::SetBestBlock(const uint256& in_block_hash)
+{
+    m_block_hash = in_block_hash;
 }
 
-unsigned int CCoinsViewCache::GetCacheSize() {
+void CCoinsViewCache::BatchWrite(CoinsViewCacheCursor& cursor, const uint256& in_block_hash)
+{
+    for (auto it{cursor.Begin()}; it != cursor.End(); it = cursor.NextAndMaybeErase(*it)) {
+        if (!it->second.IsDirty()) { // TODO a cursor can only contain dirty entries
+            continue;
+        }
+        auto [itUs, inserted]{cacheCoins.try_emplace(it->first)};
+        if (inserted) {
+            if (it->second.IsFresh() && it->second.coin.IsSpent()) {
+                cacheCoins.erase(itUs); // TODO fresh coins should have been removed at spend
+            } else {
+                // The parent cache does not have an entry, while the child cache does.
+                // Move the data up and mark it as dirty.
+                CCoinsCacheEntry& entry{itUs->second};
+                assert(entry.coin.DynamicMemoryUsage() == 0);
+                if (cursor.WillErase(*it)) {
+                    // Since this entry will be erased,
+                    // we can move the coin into us instead of copying it
+                    entry.coin = std::move(it->second.coin);
+                } else {
+                    entry.coin = it->second.coin;
+                }
+                CCoinsCacheEntry::SetDirty(*itUs, m_sentinel);
+                ++m_dirty_count;
+                cachedCoinsUsage += entry.coin.DynamicMemoryUsage();
+                // We can mark it FRESH in the parent if it was FRESH in the child
+                // Otherwise it might have just been flushed from the parent's cache
+                // and already exist in the grandparent
+                if (it->second.IsFresh()) CCoinsCacheEntry::SetFresh(*itUs, m_sentinel);
+            }
+        } else {
+            // Found the entry in the parent cache
+            if (it->second.IsFresh() && !itUs->second.coin.IsSpent()) {
+                // The coin was marked FRESH in the child cache, but the coin
+                // exists in the parent cache. If this ever happens, it means
+                // the FRESH flag was misapplied and there is a logic error in
+                // the calling code.
+                throw std::logic_error("FRESH flag misapplied to coin that exists in parent cache");
+            }
+
+            if (itUs->second.IsFresh() && it->second.coin.IsSpent()) {
+                // The grandparent cache does not have an entry, and the coin
+                // has been spent. We can just delete it from the parent cache.
+                Assume(TrySub(m_dirty_count, itUs->second.IsDirty()));
+                Assume(TrySub(cachedCoinsUsage, itUs->second.coin.DynamicMemoryUsage()));
+                cacheCoins.erase(itUs);
+            } else {
+                // A normal modification.
+                Assume(TrySub(cachedCoinsUsage, itUs->second.coin.DynamicMemoryUsage()));
+                if (cursor.WillErase(*it)) {
+                    // Since this entry will be erased,
+                    // we can move the coin into us instead of copying it
+                    itUs->second.coin = std::move(it->second.coin);
+                } else {
+                    itUs->second.coin = it->second.coin;
+                }
+                cachedCoinsUsage += itUs->second.coin.DynamicMemoryUsage();
+                if (!itUs->second.IsDirty()) {
+                    CCoinsCacheEntry::SetDirty(*itUs, m_sentinel);
+                    ++m_dirty_count;
+                }
+                // NOTE: It isn't safe to mark the coin as FRESH in the parent
+                // cache. If it already existed and was spent in the parent
+                // cache then marking it FRESH would prevent that spentness
+                // from being flushed to the grandparent.
+            }
+        }
+    }
+    SetBestBlock(in_block_hash);
+}
+
+void CCoinsViewCache::Flush(bool reallocate_cache)
+{
+    auto cursor{CoinsViewCacheCursor(m_dirty_count, m_sentinel, cacheCoins, /*will_erase=*/true)};
+    base->BatchWrite(cursor, m_block_hash);
+    Assume(m_dirty_count == 0);
+    cacheCoins.clear();
+    if (reallocate_cache) {
+        ReallocateCache();
+    }
+    cachedCoinsUsage = 0;
+}
+
+void CCoinsViewCache::Sync()
+{
+    auto cursor{CoinsViewCacheCursor(m_dirty_count, m_sentinel, cacheCoins, /*will_erase=*/false)};
+    base->BatchWrite(cursor, m_block_hash);
+    Assume(m_dirty_count == 0);
+    if (m_sentinel.second.Next() != &m_sentinel) {
+        /* BatchWrite must clear flags of all entries */
+        throw std::logic_error("Not all unspent flagged entries were cleared");
+    }
+}
+
+void CCoinsViewCache::Reset() noexcept
+{
+    cacheCoins.clear();
+    cachedCoinsUsage = 0;
+    m_dirty_count = 0;
+    SetBestBlock(uint256::ZERO);
+}
+
+void CCoinsViewCache::Uncache(const COutPoint& hash)
+{
+    CCoinsMap::iterator it = cacheCoins.find(hash);
+    if (it != cacheCoins.end() && !it->second.IsDirty()) {
+        Assume(TrySub(cachedCoinsUsage, it->second.coin.DynamicMemoryUsage()));
+        TRACEPOINT(utxocache, uncache,
+               hash.hash.data(),
+               (uint32_t)hash.n,
+               (uint32_t)it->second.coin.nHeight,
+               (int64_t)it->second.coin.out.nValue,
+               (bool)it->second.coin.IsCoinBase());
+        cacheCoins.erase(it);
+    }
+}
+
+unsigned int CCoinsViewCache::GetCacheSize() const {
     return cacheCoins.size();
 }
 
-const CTxOut &CCoinsViewCache::GetOutputFor(const CTxIn& input)
-{
-    const CCoins &coins = GetCoins(input.prevout.hash);
-    assert(coins.IsAvailable(input.prevout.n));
-    return coins.vout[input.prevout.n];
-}
-
-int64_t CCoinsViewCache::GetValueIn(const CTransaction& tx)
-{
-    if (tx.IsCoinBase())
-        return 0;
-
-    int64_t nResult = 0;
-    for (unsigned int i = 0; i < tx.vin.size(); i++)
-        nResult += GetOutputFor(tx.vin[i]).nValue;
-
-    return nResult;
-}
-
-bool CCoinsViewCache::HaveInputs(const CTransaction& tx)
+bool CCoinsViewCache::HaveInputs(const CTransaction& tx) const
 {
     if (!tx.IsCoinBase()) {
-        // first check whether information about the prevout hash is available
         for (unsigned int i = 0; i < tx.vin.size(); i++) {
-            const COutPoint &prevout = tx.vin[i].prevout;
-            if (!HaveCoins(prevout.hash))
+            if (!HaveCoin(tx.vin[i].prevout)) {
                 return false;
-        }
-
-        // then check whether the actual outputs are available
-        for (unsigned int i = 0; i < tx.vin.size(); i++) {
-            const COutPoint &prevout = tx.vin[i].prevout;
-            const CCoins &coins = GetCoins(prevout.hash);
-            if (!coins.IsAvailable(prevout.n))
-                return false;
+            }
         }
     }
     return true;
 }
 
-double CCoinsViewCache::GetPriority(const CTransaction &tx, int nHeight)
+void CCoinsViewCache::ReallocateCache()
 {
-    if (tx.IsCoinBase())
-        return 0.0;
-    double dResult = 0.0;
-    BOOST_FOREACH(const CTxIn& txin, tx.vin)
-    {
-        const CCoins &coins = GetCoins(txin.prevout.hash);
-        if (!coins.IsAvailable(txin.prevout.n)) continue;
-        if (coins.nHeight < nHeight) {
-            dResult += coins.vout[txin.prevout.n].nValue * (nHeight-coins.nHeight);
+    // Cache should be empty when we're calling this.
+    assert(cacheCoins.size() == 0);
+    cacheCoins.~CCoinsMap();
+    m_cache_coins_memory_resource.~CCoinsMapMemoryResource();
+    ::new (&m_cache_coins_memory_resource) CCoinsMapMemoryResource{};
+    ::new (&cacheCoins) CCoinsMap{0, SaltedCoinsCacheHasher{/*deterministic=*/m_deterministic}, CCoinsMap::key_equal{}, &m_cache_coins_memory_resource};
+}
+
+void CCoinsViewCache::SanityCheck() const
+{
+    size_t recomputed_usage = 0;
+    size_t count_dirty = 0;
+    for (const auto& [_, entry] : cacheCoins) {
+        if (entry.coin.IsSpent()) {
+            assert(entry.IsDirty() && !entry.IsFresh()); // A spent coin must be dirty and cannot be fresh
+        } else {
+            assert(entry.IsDirty() || !entry.IsFresh()); // An unspent coin must not be fresh if not dirty
+        }
+
+        // Recompute cachedCoinsUsage.
+        recomputed_usage += entry.coin.DynamicMemoryUsage();
+
+        // Count the number of entries we expect in the linked list.
+        if (entry.IsDirty()) ++count_dirty;
+    }
+    // Iterate over the linked list of flagged entries.
+    size_t count_linked = 0;
+    for (auto it = m_sentinel.second.Next(); it != &m_sentinel; it = it->second.Next()) {
+        // Verify linked list integrity.
+        assert(it->second.Next()->second.Prev() == it);
+        assert(it->second.Prev()->second.Next() == it);
+        // Verify they are actually flagged.
+        assert(it->second.IsDirty());
+        // Count the number of entries actually in the list.
+        ++count_linked;
+    }
+    assert(count_dirty == count_linked && count_dirty == m_dirty_count);
+    assert(recomputed_usage == cachedCoinsUsage);
+}
+
+CCoinsViewCache::ResetGuard CoinsViewOverlay::StartFetching(const CBlock& block LIFETIMEBOUND) noexcept
+{
+    Assert(m_futures.empty());
+    Assert(m_inputs.empty());
+    Assert(m_input_head.load(std::memory_order_relaxed) == 0);
+    Assert(m_input_tail == 0);
+    if (const auto workers_count{m_thread_pool->WorkersCount()}; workers_count > 0 && block.vtx.size() > 1) {
+        // Loop through the block inputs and set their prevouts in the queue.
+        // Filter inputs that spend outputs created earlier in the same block. These outputs will be created
+        // directly in the cache from the tx that creates them, so they will not be requested from a base view.
+        std::unordered_set<Txid, SaltedCoinsCacheHasher> earlier_txids;
+        earlier_txids.reserve(block.vtx.size());
+        earlier_txids.emplace(block.vtx[0]->GetHash());
+        for (const auto& tx : block.vtx | std::views::drop(1)) {
+            for (const auto& input : tx->vin) {
+                if (!earlier_txids.contains(input.prevout.hash)) m_inputs.emplace_back(input.prevout);
+            }
+            earlier_txids.emplace(tx->GetHash());
+        }
+        // Only submit tasks if we have something to fetch.
+        if (m_inputs.size()) {
+            std::vector<std::function<void()>> tasks(workers_count, [this] {
+                while (ProcessInput()) {}
+            });
+            if (auto futures{m_thread_pool->Submit(std::move(tasks))}) {
+                m_futures = std::move(*futures);
+            } else {
+                // Submit can fail if a shared owner of the thread pool outside of this class calls Stop() or
+                // Interrupt() on a different thread after we call WorkersCount() above. In that case parallel
+                // fetching will not make progress, so we clear the inputs to fall back to single threaded fetching.
+                LogWarning("Failed to submit prevout fetch tasks (%s); falling back to single-threaded fetching for this block.", SubmitErrorString(futures.error()));
+                m_inputs.clear();
+                StopFetching(); // Assert nothing changed if we failed to start tasks.
+            }
         }
     }
-    return tx.ComputePriority(dResult);
+    return CreateResetGuard();
+}
+
+static const uint64_t MIN_TRANSACTION_OUTPUT_WEIGHT{WITNESS_SCALE_FACTOR * ::GetSerializeSize(CTxOut())};
+static const uint64_t MAX_OUTPUTS_PER_BLOCK{MAX_BLOCK_WEIGHT / MIN_TRANSACTION_OUTPUT_WEIGHT};
+
+const Coin& AccessByTxid(const CCoinsViewCache& view, const Txid& txid)
+{
+    COutPoint iter(txid, 0);
+    while (iter.n < MAX_OUTPUTS_PER_BLOCK) {
+        const Coin& alternate = view.AccessCoin(iter);
+        if (!alternate.IsSpent()) return alternate;
+        ++iter.n;
+    }
+    return coinEmpty;
+}
+
+template <typename ReturnType, typename Func>
+static ReturnType ExecuteBackedWrapper(Func func, const std::vector<std::function<void()>>& err_callbacks)
+{
+    try {
+        return func();
+    } catch(const std::runtime_error& e) {
+        for (const auto& f : err_callbacks) {
+            f();
+        }
+        LogError("Error reading from database: %s\n", e.what());
+        // Starting the shutdown sequence and returning false to the caller would be
+        // interpreted as 'entry not found' (as opposed to unable to read data), and
+        // could lead to invalid interpretation. Just exit immediately, as we can't
+        // continue anyway, and all writes should be atomic.
+        std::abort();
+    }
+}
+
+std::optional<Coin> CCoinsViewErrorCatcher::GetCoin(const COutPoint& outpoint) const
+{
+    return ExecuteBackedWrapper<std::optional<Coin>>([&]() { return CCoinsViewBacked::GetCoin(outpoint); }, m_err_callbacks);
+}
+
+bool CCoinsViewErrorCatcher::HaveCoin(const COutPoint& outpoint) const
+{
+    return ExecuteBackedWrapper<bool>([&]() { return CCoinsViewBacked::HaveCoin(outpoint); }, m_err_callbacks);
+}
+
+std::optional<Coin> CCoinsViewErrorCatcher::PeekCoin(const COutPoint& outpoint) const
+{
+    return ExecuteBackedWrapper<std::optional<Coin>>([&]() { return CCoinsViewBacked::PeekCoin(outpoint); }, m_err_callbacks);
 }

@@ -1,38 +1,112 @@
 Contents
-===========
+========
 This directory contains tools for developers working on this repository.
 
-github-merge.sh
-----------------
+deterministic-fuzz-coverage
+===========================
 
-A small script to automate merging pull-requests securely and sign them with GPG.
+A tool to check for non-determinism in fuzz coverage. To get the help, run:
 
+```
+cargo run --manifest-path ./contrib/devtools/deterministic-fuzz-coverage/Cargo.toml -- --help
+```
+
+To execute the tool, compilation has to be done with the build options:
+
+```
+-DCMAKE_C_COMPILER='clang' -DCMAKE_CXX_COMPILER='clang++' -DBUILD_FOR_FUZZING=ON -DCMAKE_CXX_FLAGS='-fprofile-instr-generate -fcoverage-mapping'
+```
+
+Both llvm-profdata and llvm-cov must be installed. Also, the qa-assets
+repository must have been cloned. Finally, a fuzz target has to be picked
+before running the tool:
+
+```
+cargo run --manifest-path ./contrib/devtools/deterministic-fuzz-coverage/Cargo.toml -- $PWD/build_dir $PWD/qa-assets/fuzz_corpora fuzz_target_name [parallelism] [--mode=<both|single|combined>]
+```
+
+deterministic-unittest-coverage
+===========================
+
+A tool to check for non-determinism in unit-test coverage. To get the help, run:
+
+```
+cargo run --manifest-path ./contrib/devtools/deterministic-unittest-coverage/Cargo.toml -- --help
+```
+
+To execute the tool, compilation has to be done with the build options:
+
+```
+-DCMAKE_C_COMPILER='clang' -DCMAKE_CXX_COMPILER='clang++' -DCMAKE_CXX_FLAGS='-fprofile-instr-generate -fcoverage-mapping'
+```
+
+Both llvm-profdata and llvm-cov must be installed.
+
+```
+cargo run --manifest-path ./contrib/devtools/deterministic-unittest-coverage/Cargo.toml -- $PWD/build_dir <boost unittest filter>
+```
+
+clang-format-diff.py
+===================
+
+A script to format unified git diffs according to [.clang-format](../../src/.clang-format).
+
+Requires `clang-format`, installed e.g. via `brew install clang-format` on macOS,
+or `sudo apt install clang-format` on Debian/Ubuntu.
+
+For instance, to format the last commit with 0 lines of context,
+the script should be called from the git root folder as follows.
+
+```
+git diff -U0 HEAD~1.. | ./contrib/devtools/clang-format-diff.py -p1 -i -v
+```
+
+gen-manpages.py
+===============
+
+A small script to automatically create manpages in ../../doc/man by running the release binaries with the -help option.
+This requires help2man which can be found at: https://www.gnu.org/software/help2man/
+
+This script assumes a build directory named `build` as suggested by example build documentation.
+To use it with a different build directory, set `BUILDDIR`.
 For example:
 
-  ./github-merge.sh bitcoin/bitcoin 3077
+```bash
+BUILDDIR=$PWD/my-build-dir contrib/devtools/gen-manpages.py
+```
 
-(in any git repository) will help you merge pull request #3077 for the
-bitcoin/bitcoin repository.
+headerssync-params.py
+=====================
 
-What it does:
-* Fetch master and the pull request.
-* Locally construct a merge commit.
-* Show the diff that merge results in.
-* Ask you to verify the resulting source tree (so you can do a make
-check or whatever).
-* Ask you whether to GPG sign the merge commit.
-* Ask you whether to push the result upstream.
+A script to generate optimal parameters for the headerssync module (stored in src/kernel/chainparams.cpp). It takes no command-line
+options, as all its configuration is set at the top of the file. It runs many times faster inside PyPy. Invocation:
 
-This means that there are no potential race conditions (where a
-pullreq gets updated while you're reviewing it, but before you click
-merge), and when using GPG signatures, that even a compromised github
-couldn't mess with the sources.
+```bash
+pypy3 contrib/devtools/headerssync-params.py
+```
 
-Setup
----------
-Configuring the github-merge tool for the bitcoin repository is done in the following way:
+gen-bitcoin-conf.sh
+===================
 
-    git config githubmerge.repository bitcoin/bitcoin
-    git config githubmerge.testcmd "make -j4 check" (adapt to whatever you want to use for testing)
-    git config --global user.signingkey mykeyid (if you want to GPG sign)
+Generates a bitcoin.conf file in `share/examples/` by parsing the output from `bitcoind --help`. This script is run during the
+release process to include a bitcoin.conf with the release binaries and can also be run by users to generate a file locally.
+When generating a file as part of the release process, make sure to commit the changes after running the script.
 
+This script assumes a build directory named `build` as suggested by example build documentation.
+To use it with a different build directory, set `BUILDDIR`.
+For example:
+
+```bash
+BUILDDIR=$PWD/my-build-dir contrib/devtools/gen-bitcoin-conf.sh
+```
+
+circular-dependencies.py
+========================
+
+Run this script from the root of the source tree (`src/`) to find circular dependencies in the source code.
+This looks only at which files include other files, treating the `.cpp` and `.h` file as one unit.
+
+Example usage:
+
+    cd .../src
+    ../contrib/devtools/circular-dependencies.py {*,*/*,*/*/*}.{h,cpp}
